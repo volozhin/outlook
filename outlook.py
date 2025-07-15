@@ -26,9 +26,9 @@ def preprocess(df):
     df['Тема чистая'] = df['Тема'].str.lower().str.replace(r"^re:\s*|fw:\s*", "", regex=True).str.strip()
     # Определение роли сотрудника в письме
     df['Роль'] = df.apply(lambda row: (
-        'Отправитель' if employee_name != "" and employee_name in row['От кого'] else
-        'Получатель' if employee_name != "" and employee_name in row['Кому'] else
-        'В копии'   if employee_name != "" and employee_name in row['Копия'] else
+        'Отправитель' if employee_name != "" and employee_name in str(row['От кого']) else
+        'Получатель' if employee_name != "" and employee_name in str(row['Кому']) else
+        'В копии'   if employee_name != "" and employee_name in str(row['Копия']) else
         'Не указана'), axis=1)
     # Выделение года, номера недели и часа получения письма
     df['Год'] = df['Дата получения'].dt.isocalendar().year
@@ -46,9 +46,9 @@ def reply_time_analysis(df):
     outgoing['Дата отправки'] = outgoing['Дата отправки'].dt.tz_localize(None)
     results = []
     for _, row in incoming.iterrows():
-        # Для каждого входящего письма ищем исходящее с той же темой, отправленное позже
-        out_same_topic = outgoing[outgoing['Тема чистая'] == row['Тема чистая']]
-        after = out_same_topic[out_same_topic['Дата отправки'] > row['Дата получения']]
+        # Для каждого входящего письма ищем исходящее с тем же ConversationID, отправленное позже
+        out_same_conv = outgoing[outgoing['ConversationID'] == row['ConversationID']]
+        after = out_same_conv[out_same_conv['Дата отправки'] > row['Дата получения']]
         if not after.empty:
             soonest = after.sort_values('Дата отправки').iloc[0]
             delta_hours = (soonest['Дата отправки'] - row['Дата получения']).total_seconds() / 3600
@@ -57,6 +57,7 @@ def reply_time_analysis(df):
             end = soonest['Дата отправки'].date()
             business_days = np.busday_count(start, end)
             results.append({
+                'ConversationID': row['ConversationID'],
                 'Неделя': row['Неделя'],
                 'Тема': row['Тема'],
                 'Дата входящего': row['Дата получения'],
@@ -64,7 +65,7 @@ def reply_time_analysis(df):
                 'Время ответа': delta_hours,
                 'Время ответа (дней)': round(delta_hours / 24, 2),
                 'Рабочих дней до ответа': business_days,
-                'Просрочка': business_days > 3  # Просроченным считаем ответ более 3 рабочих дней
+                'Просрочка': business_days > 3
             })
     return pd.DataFrame(results)
 
@@ -119,7 +120,7 @@ def plot_weekly_claims(df):
     df['Рекламация'] = df['Тема'].str.lower().str.contains("рекламация")
     weekly_claims = df.groupby(['Неделя', 'Рекламация']).size().unstack(fill_value=0)
     # Переименуем столбцы для ясности
-    if True in weekly_claims.columns:  # Если есть хотя бы одна рекламация
+    if True in weekly_claims.columns:
         weekly_claims.columns = ['Без рекламации', 'С рекламацией']
     else:
         weekly_claims.columns = ['Без рекламации']
@@ -141,26 +142,61 @@ def plot_weekly_claims(df):
     return fig
 
 def stretch_topics(df):
-    # Выявление "растянутых" тем переписки (длительностью 20+ дней)
-    sent = df[df['Роль'] == 'Отправитель'].copy()
-    sent['Дата отправки'] = sent['Дата отправки'].dt.tz_localize(None)
-    grouped = sent.groupby('Тема чистая')['Дата отправки']
-    durations = grouped.max() - grouped.min()  # разница между первым и последним отправлением по теме
-    counts = sent.groupby('Тема чистая').size()
-    stretched = pd.DataFrame({
-        'Длительность': durations,
-        'Количество писем': counts
-    })
-    stretched = stretched[stretched['Длительность'] >= pd.Timedelta(days=20)]
-    return stretched.sort_values(by='Длительность', ascending=False).reset_index()
+    # Выявление "растянутых" тем переписки (длительностью 20+ дней) по ConversationID
+    stretched_list = []
+    # Рассматриваем только переписки, где сотрудник участвовал как отправитель
+    conv_with_outgoing = set(df[df['Роль'] == 'Отправитель']['ConversationID'].unique())
+    for conv_id, group in df.groupby('ConversationID'):
+        if conv_id not in conv_with_outgoing:
+            continue
+        # Убираем tz-информацию из дат для корректного сравнения
+        try:
+            group['Дата отправки'] = group['Дата отправки'].dt.tz_localize(None)
+        except:
+            pass
+        try:
+            group['Дата получения'] = group['Дата получения'].dt.tz_localize(None)
+        except:
+            pass
+        # Находим самое раннее и самое позднее время в переписке
+        min_received = group['Дата получения'].min()
+        min_sent = group['Дата отправки'].min()
+        max_received = group['Дата получения'].max()
+        max_sent = group['Дата отправки'].max()
+        if pd.isna(min_received):
+            earliest = min_sent
+        elif pd.isna(min_sent):
+            earliest = min_received
+        else:
+            earliest = min(min_received, min_sent)
+        if pd.isna(max_received):
+            latest = max_sent
+        elif pd.isna(max_sent):
+            latest = max_received
+        else:
+            latest = max(max_received, max_sent)
+        duration = (latest - earliest) if pd.notna(earliest) and pd.notna(latest) else pd.Timedelta(0)
+        if duration >= pd.Timedelta(days=20):
+            count_messages = len(group)
+            # Представительная тема переписки: берем тему первого сообщения по времени
+            rep_subject = group.sort_values(
+                ['Дата получения', 'Дата отправки']).iloc[0]['Тема чистая']
+            stretched_list.append({
+                'ConversationID': conv_id,
+                'Тема чистая': rep_subject,
+                'Длительность': duration,
+                'Количество писем': count_messages
+            })
+    stretched_df = pd.DataFrame(stretched_list)
+    return stretched_df.sort_values(by='Длительность', ascending=False).reset_index(drop=True)
 
 def normalize_name(name):
     # Нормализация имени сотрудника: убрать лишние пробелы, привести к нижнему регистру
-    name = ' '.join(name.strip().split())
+    name = ' '.join(str(name).strip().split())
     return name.lower()
 
 def plot_department_traffic(incoming_summary, outgoing_summary):
-    fig1, ax1 = plt.subplots(figsize=(6, 4))  # уменьшенный размер
+    fig1, ax1 = plt.subplots(figsize=(6, 4))
     incoming_summary.sort_values().plot(kind='barh', ax=ax1, color='#1f77b4')
     ax1.set_title('Входящие письма', fontsize=10)
     ax1.set_xlabel('Писем', fontsize=8)
@@ -169,7 +205,7 @@ def plot_department_traffic(incoming_summary, outgoing_summary):
     ax1.tick_params(axis='y', labelsize=7)
     ax1.grid(axis='x')
 
-    fig2, ax2 = plt.subplots(figsize=(6, 4))  # уменьшенный размер
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
     outgoing_summary.sort_values().plot(kind='barh', ax=ax2, color='#ff7f0e')
     ax2.set_title('Исходящие письма', fontsize=10)
     ax2.set_xlabel('Писем', fontsize=8)
@@ -214,43 +250,31 @@ if uploaded_file:
         st.metric("Среднее время ответа (ч)", round(reply_df['Время ответа'].mean(), 2))
         st.metric("Медианное время ответа (ч)", round(reply_df['Время ответа'].median(), 2))
 
-        # 🔹 Считаем количество писем по каждой теме из reply_df
+        # 🔹 Считаем количество писем по каждой переписке (ConversationID)
         message_counts = []
-        for topic in reply_df['Тема'].str.lower().str.strip().unique():
-            count = df[df['Тема чистая'] == topic].shape[0]
+        for conv_id in reply_df['ConversationID'].unique():
+            count = df[df['ConversationID'] == conv_id].shape[0]
             message_counts.append(count)
 
         if message_counts:
             st.metric("Среднее количество писем на инцидент", round(pd.Series(message_counts).mean(), 1))
-
-            st.subheader("📈 Распределение количества писем на один инцидент")
-
-            fig_msg, ax = plt.subplots(figsize=(8, 2))  # ⬅️ Сжатый по вертикали график
-
-            counts, bins, _ = ax.hist(
-                message_counts,
-                bins=range(1, max(message_counts) + 2),
-                edgecolor='black',
-                align='left'
-            )
-
+            st.subheader("📈 Распределение количества писем на инцидент")
+            fig_msg, ax = plt.subplots(figsize=(8, 2))
+            ax.hist(message_counts, bins=range(1, max(message_counts) + 2), edgecolor='black', align='left')
             ax.set_title("Распределение количества писем на инцидент", fontsize=10)
             ax.set_xlabel("Количество писем", fontsize=8)
             ax.set_ylabel("Частота", fontsize=8)
-
             ax.tick_params(axis='x', labelsize=7)
             ax.tick_params(axis='y', labelsize=7)
-
             ax.grid(axis='y', linestyle='--', alpha=0.6)
-
             st.pyplot(fig_msg)
 
         st.metric("Мин. время ответа (ч)", round(reply_df['Время ответа'].min(), 2))
         st.metric("Макс. время ответа (ч)", round(reply_df['Время ответа'].max(), 2))
 
         message_counts = []
-        for topic in reply_df['Тема'].str.lower().str.strip().unique():
-            count = df[df['Тема чистая'] == topic].shape[0]
+        for conv_id in reply_df['ConversationID'].unique():
+            count = df[df['ConversationID'] == conv_id].shape[0]
             message_counts.append(count)
 
         if message_counts:
@@ -266,7 +290,6 @@ if uploaded_file:
     else:
         st.info("Нет данных для анализа времени ответа.")
 
-
     col1, col2 = st.columns(2)
     with col1:
         st.pyplot(plot_weekly_message_flow(df))
@@ -280,10 +303,16 @@ if uploaded_file:
     selected_topic = st.selectbox("Выберите тему для детализации переписки", options=stretched_df['Тема чистая'] if not stretched_df.empty else [])
     if selected_topic:
         st.subheader("📥 Детализация переписки по выбранной теме")
-        topic_messages = df[df['Тема чистая'] == selected_topic][[
-            'Дата получения', 'Дата отправки', 'От кого', 'Кому', 'Копия', 'Тема', 'Роль'
-        ]]
-        st.dataframe(topic_messages.sort_values(by='Дата отправки'))
+        # Находим соответствующий ConversationID для выбранной темы
+        conv_ids = stretched_df[stretched_df['Тема чистая'] == selected_topic]['ConversationID'].tolist()
+        if conv_ids:
+            conv_id = conv_ids[0]
+            topic_messages = df[df['ConversationID'] == conv_id][[
+                'Дата получения', 'Дата отправки', 'От кого', 'Кому', 'Копия', 'Тема', 'Роль'
+            ]]
+            st.dataframe(topic_messages.sort_values(by='Дата отправки'))
+        else:
+            st.info("Переписка не найдена.")
 
     st.subheader("⚠ Письма с ответом позже 3 рабочих дней")
     late_replies = reply_df[reply_df['Просрочка'] == True]
@@ -307,7 +336,7 @@ if uploaded_file:
         for col in ['От кого', 'Кому', 'Копия']:
             df[col] = df[col].fillna("")
             for entry in df[col]:
-                parts = entry.split(';')
+                parts = str(entry).split(';')
                 for name in parts:
                     norm_name = normalize_name(name)
                     if norm_name and 'нет данных' not in norm_name and '@' not in norm_name:
@@ -320,7 +349,7 @@ if uploaded_file:
         filtered_df = merged_df.dropna(subset=['Подразделение'])
         filtered_df_no_claims = filtered_df[filtered_df['Подразделение'].str.lower() != 'претензионный отдел']
 
-        # Группируем по отделам – входящие письма
+        # Группируем по отделам – входящие письма (для топ-10 отделов)
         department_summary_no_claims = (
             filtered_df_no_claims.groupby('Подразделение')['Количество писем']
             .sum()
@@ -328,11 +357,11 @@ if uploaded_file:
             .head(10)
         )
 
-        # Сбор всех имен адресатов (исходящая почта: только Кому и Копия)
+        # Сбор всех имен адресатов (исходящая почта: Кому и Копия)
         outgoing_names = []
         for col in ['Кому', 'Копия']:
             for entry in df[col]:
-                parts = entry.split(';')
+                parts = str(entry).split(';')
                 for name in parts:
                     norm_name = normalize_name(name)
                     if norm_name and 'нет данных' not in norm_name and '@' not in norm_name:
